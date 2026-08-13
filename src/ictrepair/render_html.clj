@@ -326,19 +326,29 @@
   (let [approved (filter #(and (= :approved (:decision %))
                                (= :commit (:final-disposition %)))
                          steps)
-        rows (for [{:keys [op subject record]} approved
+        rows (for [{:keys [op subject record reached-human?]} approved
                    :let [effect (:effect record)
                          art    (persisted-artifact db effect subject)
-                         ks     (approver-keys-in art)]]
+                         ks     (approver-keys-in art)
+                         onp    (approver-keys-in (:payload record))
+                         onv    (approver-keys-in (:value record))]]
                {:op op :subject subject :effect effect
-                :offered-on-payload (approver-keys-in (:payload record))
-                :offered-on-value   (approver-keys-in (:value record))
+                ;; a phase-3 auto-eligible op commits WITHOUT ever
+                ;; interrupting, so no approver is offered to begin with.
+                ;; Calling that "lost" would report a drop that never
+                ;; happened -- see `s-approver`.
+                :reached-human?     (boolean reached-human?)
+                :offered-on-payload onp
+                :offered-on-value   onv
+                :offered?           (boolean (or (seq onp) (seq onv)))
                 :persisted-keys ks
                 :retained? (boolean (seq ks))})
         rows (vec (sort-by (juxt (comp pr-str :effect) :subject) rows))]
     {:rows rows
+     :offered  (filterv :offered? rows)
      :retained (filterv :retained? rows)
-     :lost (filterv (complement :retained?) rows)
+     :dropped     (filterv #(and (:offered? %) (not (:retained? %))) rows)
+     :not-offered (filterv (complement :offered?) rows)
      :ledger-approver-keys (into (sorted-set) (mapcat approver-keys-in ledger))
      ;; the graph DOES mint an :approval-granted audit fact carrying :by,
      ;; but `ictrepair.operation`'s :commit node appends only the commit
@@ -414,7 +424,15 @@
      (str "A hard refusal is un-overridable: no human approval and no rollout phase "
           "can release it. <code>detail</code> is reproduced verbatim as "
           "<code>ictrepair.governor</code> wrote it. Every one of these runs "
-          "terminated at the <code>:hold</code> node without ever reaching a human.")
+          "terminated at the <code>:hold</code> node without ever reaching a human. "
+          "The <em>confidence</em> column is the advisor's own self-reported number; "
+          "read it against <code>ictrepair.governor/confidence-floor</code> = "
+          "<code>" (esc (str governor/confidence-floor)) "</code> — note that a hard "
+          "refusal does not care about it, which is the point: rows below fire at "
+          "confidence well ABOVE the floor. Falling under the floor only ESCALATES "
+          "(to a human), as do the "
+          (str/join " / " (map code* (sort-by pr-str governor/high-stakes)))
+          " stakes, which no phase ever auto-commits.")
      (table ["ledger #" "rule" "op" "subject" "confidence" "governor detail"]
             (for [f hh
                   v (:violations f)]
@@ -532,8 +550,15 @@
                (esc (get rec "ticket_id")) (esc (get rec "jurisdiction"))
                (if (get rec "immutable") (pill :ok "true") (pill :err "false"))])))))
 
+(defn- effect-list
+  "Distinct effects of `rows`, in a stable order, as inline code. Rows
+  are per (effect, subject), so mapping straight over them repeats an
+  effect once per subject."
+  [rows]
+  (str/join ", " (map code* (sort-by pr-str (distinct (map :effect rows))))))
+
 (defn- s-approver [probe]
-  (let [{:keys [rows retained lost ledger-approver-keys
+  (let [{:keys [rows offered retained dropped not-offered ledger-approver-keys
                 approval-granted-in-audit approval-granted-in-ledger]} probe]
     (section
      "approver" "Approver attribution — measured, not asserted"
@@ -544,37 +569,46 @@
           "the EXECUTING actor (<code>op-1</code>), never the human who approved "
           "(<code>" (esc approver-id) "</code>).")
      (str
-      (table ["effect" "subject" "offered on :payload" "offered on :value"
+      (table ["effect" "subject" "human asked?" "offered on :payload" "offered on :value"
               "persisted by the store" "attribution"]
-             (for [{:keys [effect subject offered-on-payload offered-on-value
-                           persisted-keys retained?]} rows]
+             (for [{:keys [effect subject reached-human? offered-on-payload offered-on-value
+                           persisted-keys offered? retained?]} rows]
                [(code* effect) (esc subject)
+                (if reached-human? (pill :ok "yes") (pill :muted "no — auto-commit"))
                 (if (seq offered-on-payload) (str/join " " (map code* offered-on-payload))
                     (pill :muted "none"))
                 (if (seq offered-on-value) (str/join " " (map code* offered-on-value))
                     (pill :muted "none"))
                 (if (seq persisted-keys) (str/join " " (map code* persisted-keys))
                     (pill :muted "none"))
-                (if retained? (pill :ok "retained") (pill :err "lost"))]))
+                (cond retained?       (pill :ok "retained")
+                      offered?        (pill :err "dropped by the store")
+                      :else           (pill :muted "n/a — none offered"))]))
       "<p class=\"note\">"
-      (if (seq lost)
+      (if (seq dropped)
         (str (pill :err "DISCLOSED DEFECT")
-             " Attribution is <strong>lossy per effect</strong> in this repo, as measured above: "
-             (count retained) " of " (count rows) " approved effects retained the approver, "
-             (count lost) " lost it. "
+             " Attribution is <strong>lossy per effect</strong> in this repo, as measured "
+             "above. Of " (count rows) " committed effects, " (count offered)
+             " were actually offered an approver (a human resumed the run); of those, "
+             (count retained) " retained it and <strong>" (count dropped)
+             " were dropped by the store</strong>. "
              "<code>ictrepair.operation</code> mints the approver onto the record's "
              "<code>:payload</code> only; <code>ictrepair.store/commit-record!</code> then "
-             "persists <code>:payload</code> for the "
-             (str/join ", " (map (comp code* :effect) (sort-by (comp pr-str :effect) retained)))
-             " effects but persists <code>:value</code> (or reconstructs the record from "
-             "scratch) for "
-             (str/join ", " (map (comp code* :effect) (sort-by (comp pr-str :effect) lost)))
+             "persists <code>:payload</code> for " (effect-list retained)
+             ", but persists <code>:value</code> (or rebuilds the record from "
+             "<code>ictrepair.registry</code> and never reads either) for "
+             (effect-list dropped)
              " — so the approver is dropped there. This is reported by probing the "
              "artefacts, so it will read <code>retained</code> on its own the day the "
              "store is fixed. <strong>Not patched here</strong>: changing commit "
              "semantics is not a rendering task.")
         (str (pill :ok "no attribution loss measured")
-             " Every approved effect retained an approver key this run."))
+             " Every committed effect that was offered an approver retained it this run."))
+      (when (seq not-offered)
+        (str " The remaining " (count not-offered) " row(s) — " (effect-list not-offered)
+             " — are <strong>not</strong> a defect: those runs were auto-eligible at their "
+             "rollout phase, committed without ever interrupting, and so had no approver to "
+             "keep. Counting them as losses would report a drop that never happened."))
       "</p><p class=\"note\">"
       (pill :err "DISCLOSED DEFECT")
       " The graph emits <code>:approval-granted</code> audit facts carrying "
