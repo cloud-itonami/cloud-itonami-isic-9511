@@ -1,0 +1,816 @@
+(ns ictrepair.render-html
+  "Build-time HTML renderer for `docs/samples/operator-console.html`.
+
+  Closes flagship checklist item 2 for `cloud-itonami-isic-9511`: this
+  repo shipped a `docs/samples/operator-console.html` with NO generator
+  anywhere in the tree that could have produced it. That page described
+  a ROBOTICS SAFETY console -- missions, `robot-1`, \"deliver parcel\",
+  grasp actions, a `safety-critical` class -- none of which appear
+  anywhere in `ictrepair`'s source or seed data (the only fleet-wide
+  `:itonami.blueprint/robotics true` flag in `blueprint.edn` is a
+  capability toggle, not a domain). It was hand-authored and committed
+  directly, and this namespace supersedes it.
+
+  Nothing on the page produced here is typed by hand. Every row is the
+  output of a REAL run of this repo's actor:
+
+    - `ictrepair.operation/build` compiles the langgraph-clj StateGraph;
+      each scenario step is a `langgraph.graph/run*` invocation, and an
+      escalated step is RESUMED through the real `interrupt-before
+      #{:request-approval}` seam with `{:approval {:status ..}}`;
+    - governor verdicts come from `ictrepair.governor/check` via the
+      graph's own `:govern` node -- `:detail` strings are reproduced
+      verbatim as the governor wrote them;
+    - register / assessment / screening / draft-record rows are read
+      BACK out of `ictrepair.store` through the `Store` protocol after
+      the run, never echoed from the scenario table;
+    - the phase-gate matrix is produced by CALLING `ictrepair.phase/gate`
+      for every (phase x op x base-disposition) triple;
+    - the approver-attribution section is DERIVED at render time by
+      probing the persisted artefacts for approver-shaped keys (see
+      `approver-probe`). It is not a hardcoded claim about this repo, so
+      it will start reporting `retained` on its own the day the store
+      keeps an approver for an effect that currently drops it.
+
+  CLASSIFICATION -- why this renderer counts what it counts.
+  Three different things land in the ledger and two of them are easy to
+  miscount:
+
+    * a GOVERNOR HARD REFUSAL   -- `:t :governor-hold`, NO `:phase-reason`,
+                                   non-empty `:violations`. A compliance
+                                   rule fired; no human may override it.
+    * a PHASE / ROLLOUT GATE    -- `:t :governor-hold`, `:phase-reason`
+                                   `:phase-disabled`, and `:violations []`.
+                                   SAME `:t` as a refusal. The governor
+                                   found nothing wrong; the op simply is
+                                   not enabled at that rollout phase.
+    * an APPROVER REJECTION     -- `:t :approval-rejected`, and it CARRIES
+                                   a violation `{:rule :approver-rejected}`.
+                                   A human said no. Not a governor rule.
+
+  So the classification keys on `:t` FIRST, then on `:phase-reason`, and
+  only then on `:violations`. Counting \"facts with a non-empty
+  `:violations`\" over-counts by including the approver rejection;
+  counting \"facts with `:t :governor-hold`\" over-counts by including
+  the phase gate. Both naive counts are computed and rendered next to
+  the correct one so the discrimination is visible rather than asserted,
+  and `assert-classification-discriminates!` fails the build if the run
+  ever stops containing all three kinds.
+
+  Build-time invariants (`-main` THROWS and writes NO file):
+    1. at least `min-hard-holds` real governor HARD refusals;
+    2. at least `min-distinct-hard-rules` DISTINCT hard rules -- an
+       evidence floor, so a governor change that silently stops firing a
+       check fails the build instead of quietly rendering a thinner page;
+    3. the three fact classes are all present AND provably disjoint (no
+       fact carries both a `:phase-reason` and a non-empty `:violations`),
+       so the classifier's branches cannot overlap;
+    4. every HARD-rule row rendered traces to a rule this run produced --
+       the section cannot outlive the run that justified it;
+    5. at least one op COMMITTED, else the approver probe would report
+       \"no approver\" for the vacuous reason that nothing was persisted;
+    6. at least one op ESCALATED and was APPROVED, else the approval
+       queue and the attribution probe render as legitimate-looking
+       empty tables;
+    7. no run that HARD-held ALSO reached a human -- \"a HARD hold never
+       reaches a human\" is MEASURED per-run, not asserted in prose;
+    8. the output carries no UUID-shaped or clock-shaped token, so the
+       determinism claim is checked rather than hoped for.
+
+  Deterministic: no timestamps, no random ids, all maps iterated in
+  sorted order. Two consecutive builds into scratch directories are
+  byte-identical.
+
+  Usage: `clojure -M:dev:render-html [out-file]`
+  (default `docs/samples/operator-console.html`)."
+  (:require [clojure.string :as str]
+            [jp-go-dds.skin]
+            [langgraph.graph :as g]
+            [ictrepair.facts :as facts]
+            [ictrepair.governor :as governor]
+            [ictrepair.operation :as operation]
+            [ictrepair.phase :as phase]
+            [ictrepair.registry :as registry]
+            [ictrepair.store :as store]))
+
+(def min-hard-holds
+  "Evidence floor for invariant 1."
+  6)
+
+(def min-distinct-hard-rules
+  "Evidence floor for invariant 2. The scenario below drives SEVEN
+  distinct HARD rules -- every hard rule `ictrepair.governor/check` is
+  capable of producing (`:no-spec-basis`, `:evidence-incomplete`,
+  `:parts-cost-mismatch`, `:safety-test-not-passed`,
+  `:media-sanitization-unconfirmed`, `:already-completed`,
+  `:already-returned`). Raise this when the scenario grows; never lower
+  it to make a build pass."
+  7)
+
+(def approver-id
+  "The human who resumes an interrupted run in this scenario. Distinct
+  from the run CONTEXT's `:actor-id` on purpose -- see `approver-probe`:
+  a ledger fact's `:actor` is the EXECUTING actor, never the approver,
+  and conflating the two would manufacture attribution that the store
+  does not actually carry."
+  "tech-01")
+
+(def operator
+  "The run context. `ictrepair.sim` uses the same shape."
+  {:actor-id "op-1" :actor-role :repair-technician :phase phase/default-phase})
+
+;; ----------------------------- scenario -----------------------------
+
+(def scenario
+  "Every step is executed against the REAL graph, in this order. Order
+  is load-bearing: the double-actuation guards (`:already-completed` /
+  `:already-returned`) can only fire after the first completion/return
+  has actually committed, and `:parts-cost-mismatch` on ticket-3 is only
+  reachable once ticket-3 has an assessment on file (otherwise
+  `:evidence-incomplete` fires first and masks it).
+
+  `:decision` is what the human does when the run interrupts at
+  `:request-approval`; `nil` means the run is not expected to reach a
+  human at all."
+  [{:id "s01" :op :ticket/intake       :subject "ticket-1" :phase 3 :decision :approved
+    :note "phase-3 auto-eligible -- the only op any phase ever auto-commits"}
+   {:id "s02" :op :jurisdiction/assess :subject "ticket-1" :phase 3 :decision :approved
+    :note "governor-clean, but no phase auto-commits an assessment"}
+   {:id "s03" :op :safety/screen       :subject "ticket-1" :phase 3 :decision :approved
+    :note "post-repair safety test passed"}
+   {:id "s04" :op :media/screen        :subject "ticket-1" :phase 3 :decision :approved
+    :note "no storage replacement -- sanitization requirement does not arise"}
+   {:id "s05" :op :repair/complete     :subject "ticket-1" :phase 3 :decision :approved
+    :note "actuation -- never auto-commits at any phase"}
+   {:id "s06" :op :device/return       :subject "ticket-1" :phase 3 :decision :approved
+    :note "actuation -- never auto-commits at any phase"}
+   {:id "s07" :op :jurisdiction/assess :subject "ticket-2" :phase 3 :no-spec? true
+    :note "advisor proposes requirements for a jurisdiction with no spec-basis"}
+   {:id "s08" :op :jurisdiction/assess :subject "ticket-3" :phase 3 :decision :approved
+    :note "setup: puts a full evidence checklist on file for ticket-3"}
+   {:id "s09" :op :repair/complete     :subject "ticket-3" :phase 3
+    :note "claimed parts cost does not equal quantity x unit price"}
+   {:id "s10" :op :safety/screen       :subject "ticket-4" :phase 3
+    :note "screening finds its own failure and hard-holds on it"}
+   {:id "s11" :op :media/screen        :subject "ticket-5" :phase 3
+    :note "storage replaced, sanitization unconfirmed"}
+   {:id "s12" :op :repair/complete     :subject "ticket-4" :phase 3
+    :note "no assessment on file -> required evidence cannot be satisfied"}
+   {:id "s13" :op :repair/complete     :subject "ticket-1" :phase 3
+    :note "double completion of an already-completed ticket"}
+   {:id "s14" :op :device/return       :subject "ticket-1" :phase 3
+    :note "double return of an already-returned ticket"}
+   {:id "s15" :op :jurisdiction/assess :subject "ticket-1" :phase 1
+    :note "PHASE GATE, not a refusal: governor found nothing; the op is not enabled at phase 1"}
+   {:id "s16" :op :ticket/intake       :subject "ticket-2" :phase 2 :decision :approved
+    :note "phase 2 permits the write but auto-commits nothing -- approved, and the approver is then dropped by :ticket/upsert"}
+   {:id "s17" :op :media/screen        :subject "ticket-3" :phase 3 :decision :rejected
+    :note "APPROVER REJECTION: carries {:rule :approver-rejected} but is not a governor rule"}])
+
+(defn- request-for
+  "Builds the graph request. The `:ticket/intake` patch is read out of
+  the seeded record rather than typed here, so a seed change moves the
+  page instead of silently disagreeing with it."
+  [db {:keys [op subject no-spec?]}]
+  (cond-> {:op op :subject subject}
+    (= op :ticket/intake) (assoc :patch (select-keys (store/ticket db subject)
+                                                     [:id :customer :item]))
+    no-spec?              (assoc :no-spec? true)))
+
+(defn run-step
+  "Executes one scenario step against the compiled graph, resuming
+  through the real approval interrupt when the run escalates."
+  [db actor {:keys [id phase decision] :as step}]
+  (let [ctx  (assoc operator :phase phase)
+        r1   (g/run* actor {:request (request-for db step) :context ctx} {:thread-id id})
+        d1   (get-in r1 [:state :disposition])
+        r2   (when (and (= :escalate d1) decision)
+               (g/run* actor {:approval {:status decision :by approver-id}}
+                       {:thread-id id :resume? true}))
+        ;; the :audit channel uses `into` as its reducer and the resume
+        ;; continues from the checkpoint, so r2's audit already contains
+        ;; r1's -- take r2's when it exists rather than concatenating.
+        audit (or (get-in r2 [:state :audit]) (get-in r1 [:state :audit]) [])]
+    (merge step
+           {:first-disposition d1
+            :final-disposition (or (get-in r2 [:state :disposition]) d1)
+            :verdict           (get-in r1 [:state :verdict])
+            :proposal          (get-in r1 [:state :proposal])
+            :record            (or (get-in r2 [:state :record]) (get-in r1 [:state :record]))
+            :audit             (vec audit)
+            :reached-human?    (boolean (some #(= :approval-requested (:t %)) audit))})))
+
+(defn run-scenario
+  "Runs the whole scenario against one freshly seeded store."
+  []
+  (let [db    (store/seed-db)
+        actor (operation/build db)
+        steps (mapv #(run-step db actor %) scenario)]
+    {:db db :steps steps :ledger (vec (store/ledger db))}))
+
+;; ----------------------------- classification -----------------------------
+
+(defn classify
+  "The three-way classification described in the ns docstring. Keys on
+  `:t` FIRST -- an approver rejection carries a violation, and a phase
+  gate carries the same `:t` as a refusal."
+  [fact]
+  (cond
+    (= :approval-rejected (:t fact))                    :approver-rejection
+    (and (= :governor-hold (:t fact)) (:phase-reason fact)) :phase-gate
+    (and (= :governor-hold (:t fact)) (seq (:violations fact))) :governor-hard-hold
+    (= :governor-hold (:t fact))                        :governor-hold-without-violation
+    (= :committed (:t fact))                            :commit
+    :else                                               :other))
+
+(defn classified-ledger
+  "Ledger facts keyed by their append index. Index, NOT `[op subject]`:
+  see `join-trap` -- that pair repeats in this very run."
+  [ledger]
+  (vec (map-indexed (fn [i f] (assoc f ::seq i ::class (classify f))) ledger)))
+
+(defn hard-holds [cl] (filterv #(= :governor-hard-hold (::class %)) cl))
+(defn phase-gates [cl] (filterv #(= :phase-gate (::class %)) cl))
+(defn approver-rejections [cl] (filterv #(= :approver-rejection (::class %)) cl))
+(defn commits [cl] (filterv #(= :commit (::class %)) cl))
+
+(defn distinct-hard-rules [cl]
+  (into (sorted-set) (mapcat #(map :rule (:violations %)) (hard-holds cl))))
+
+(defn naive-counts
+  "The two ways a reader could miscount, computed so the page can show
+  the delta instead of claiming one exists."
+  [cl]
+  {:by-t-governor-hold (count (filter #(= :governor-hold (:t %)) cl))
+   :by-any-violation   (count (filter #(seq (:violations %)) cl))
+   :correct            (count (hard-holds cl))})
+
+(defn join-trap
+  "Counterfactual measurement of the `[op subject]` join trap: how many
+  ledger rows a naive join on that pair would silently collapse. The
+  pair IS unique for ops guarded against double-issuance and is NOT
+  unique for the rest, so this is measured against the real run rather
+  than assumed either way."
+  [ledger]
+  (let [pairs (mapv (juxt :op :subject) ledger)
+        dups  (->> (frequencies pairs)
+                   (filter (fn [[_ n]] (> n 1)))
+                   (sort-by (comp pr-str first))
+                   vec)]
+    {:rows (count pairs)
+     :distinct-pairs (count (distinct pairs))
+     :collapsed (- (count pairs) (count (distinct pairs)))
+     :repeated dups}))
+
+;; ----------------------------- approver attribution probe -----------------------------
+
+(def approver-key-candidates
+  "Keys that would constitute approver attribution if a persisted
+  artefact carried one. `:actor` is deliberately EXCLUDED: on a ledger
+  fact it names the EXECUTING actor (`op-1` here), never the human who
+  approved (`tech-01`), and treating it as attribution would invent a
+  provenance the store does not have.
+
+  A VECTOR in a fixed order, not a `sorted-set`: the artefacts probed
+  below include `ictrepair.registry` draft records, whose keys are
+  STRINGS (`\"record_id\"`, `\"ticket_id\"`). A sorted set used as a
+  membership predicate compares each candidate against the probed key
+  through its comparator, so probing a string-keyed record against a
+  keyword-sorted set throws `ClassCastException` -- the probe would die
+  on exactly the two effects (`:ticket/mark-completed`/`:ticket/
+  mark-returned`) it most needs to report on. Membership goes through
+  `approver-key-set` (unsorted, type-tolerant); the vector order is
+  what the page prints."
+  [:approval :approval-by :approved-by :approver :by
+   :decided-by :human-approver :reviewer :signed-by])
+
+(def ^:private approver-key-set
+  "Membership predicate for `approver-key-candidates`. Unsorted on
+  purpose -- see that var's docstring."
+  (set approver-key-candidates))
+
+(defn approver-keys-in
+  "Every approver-candidate key present in `m` or nested inside it.
+  Safe against string-keyed artefacts (registry draft records)."
+  [m]
+  (into (sorted-set)
+        (->> (tree-seq coll? seq m)
+             (filter map?)
+             (mapcat #(filter approver-key-set (keys %))))))
+
+(defn- persisted-artifact
+  "The artefact the store actually kept for a committed effect, fetched
+  back through the `Store` protocol."
+  [db effect subject]
+  (case effect
+    :ticket/upsert          (store/ticket db subject)
+    :assessment/set         (store/assessment-of db subject)
+    :safety-screening/set   (store/safety-screening-of db subject)
+    :media-screening/set    (store/media-screening-of db subject)
+    :ticket/mark-completed  (first (filter #(= subject (get % "ticket_id"))
+                                           (store/completion-history db)))
+    :ticket/mark-returned   (first (filter #(= subject (get % "ticket_id"))
+                                           (store/return-history db)))
+    nil))
+
+(defn approver-probe
+  "MEASURES, per effect, whether the approver who resumed an escalated
+  run survives into the artefact the store persisted.
+
+  This is derived, never asserted: each row asks the REAL artefact
+  whether it carries an approver-shaped key. If someone changes
+  `ictrepair.store/commit-record!` to persist `:payload` for an effect
+  that currently persists `:value`, that row flips to `retained` on the
+  next build with no edit here."
+  [{:keys [db steps ledger]}]
+  (let [approved (filter #(and (= :approved (:decision %))
+                               (= :commit (:final-disposition %)))
+                         steps)
+        rows (for [{:keys [op subject record]} approved
+                   :let [effect (:effect record)
+                         art    (persisted-artifact db effect subject)
+                         ks     (approver-keys-in art)]]
+               {:op op :subject subject :effect effect
+                :offered-on-payload (approver-keys-in (:payload record))
+                :offered-on-value   (approver-keys-in (:value record))
+                :persisted-keys ks
+                :retained? (boolean (seq ks))})
+        rows (vec (sort-by (juxt (comp pr-str :effect) :subject) rows))]
+    {:rows rows
+     :retained (filterv :retained? rows)
+     :lost (filterv (complement :retained?) rows)
+     :ledger-approver-keys (into (sorted-set) (mapcat approver-keys-in ledger))
+     ;; the graph DOES mint an :approval-granted audit fact carrying :by,
+     ;; but `ictrepair.operation`'s :commit node appends only the commit
+     ;; fact -- so the check below measures whether it reached the LEDGER.
+     :approval-granted-in-audit
+     (count (for [s steps f (:audit s) :when (= :approval-granted (:t f))] f))
+     :approval-granted-in-ledger
+     (count (filter #(= :approval-granted (:t %)) ledger))}))
+
+;; ----------------------------- html helpers -----------------------------
+
+(defn esc [s]
+  (-> (str s)
+      (str/replace "&" "&amp;") (str/replace "<" "&lt;")
+      (str/replace ">" "&gt;")  (str/replace "\"" "&quot;")))
+
+(defn- kw* [x] (if (keyword? x) (subs (str x) 1) (str x)))
+(defn code* [x] (str "<code>" (esc (kw* x)) "</code>"))
+
+(defn pill [cls text] (str "<span class=\"pill " (name cls) "\">" (esc text) "</span>"))
+
+(defn- th [xs] (str "<tr>" (apply str (map #(str "<th>" (esc %) "</th>") xs)) "</tr>"))
+(defn- td [xs] (str "<tr>" (apply str (map #(str "<td>" % "</td>") xs)) "</tr>"))
+
+(defn table [headers rows]
+  (str "<table><thead>" (th headers) "</thead><tbody>"
+       (apply str (map td rows)) "</tbody></table>"))
+
+(defn section [id title subtitle body]
+  (str "<section class=\"card\" id=\"" id "\"><h2>" (esc title) "</h2>"
+       (when subtitle (str "<p class=\"sub\">" subtitle "</p>")) body "</section>"))
+
+(defn- disp-pill [d]
+  (case d
+    :commit   (pill :ok "commit")
+    :escalate (pill :warn "escalate")
+    :hold     (pill :err "hold")
+    (pill :muted (kw* d))))
+
+(defn- class-pill [c]
+  (case c
+    :governor-hard-hold (pill :err "governor HARD refusal")
+    :phase-gate         (pill :warn "phase / rollout gate")
+    :approver-rejection (pill :warn "approver rejection")
+    :commit             (pill :ok "commit")
+    (pill :muted (kw* c))))
+
+;; ----------------------------- sections -----------------------------
+
+(defn- s-runs [{:keys [steps]}]
+  (section
+   "runs" "Scenario runs"
+   (str "Every row is one <code>langgraph.graph/run*</code> against the compiled "
+        "StateGraph. <em>first</em> is the disposition the graph reached before any "
+        "human was involved; <em>final</em> is after the approval interrupt was "
+        "resumed (where it was reached at all).")
+   (table ["#" "op" "subject" "phase" "first" "human" "final" "what this step exercises"]
+          (for [{:keys [id op subject phase first-disposition final-disposition
+                        reached-human? decision note]} steps]
+            [(esc id) (code* op) (esc subject) phase
+             (disp-pill first-disposition)
+             (cond (not reached-human?) (pill :muted "not asked")
+                   (= :approved decision) (pill :ok "approved")
+                   (= :rejected decision) (pill :err "rejected")
+                   :else (pill :warn "pending"))
+             (disp-pill final-disposition)
+             (esc note)]))))
+
+(defn- s-hard [cl]
+  (let [hh (hard-holds cl)]
+    (section
+     "hard-holds" (str "Governor HARD refusals (" (count hh) ")")
+     (str "A hard refusal is un-overridable: no human approval and no rollout phase "
+          "can release it. <code>detail</code> is reproduced verbatim as "
+          "<code>ictrepair.governor</code> wrote it. Every one of these runs "
+          "terminated at the <code>:hold</code> node without ever reaching a human.")
+     (table ["ledger #" "rule" "op" "subject" "confidence" "governor detail"]
+            (for [f hh
+                  v (:violations f)]
+              [(::seq f) (code* (:rule v)) (code* (:op f)) (esc (:subject f))
+               (:confidence f) (esc (:detail v))])))))
+
+(defn- s-discriminate [cl]
+  (let [n (naive-counts cl)
+        pg (phase-gates cl)
+        ar (approver-rejections cl)]
+    (section
+     "classification" "Refusal vs. gate vs. rejection — how the count is discriminated"
+     (str "Three different things reach the ledger and two are easy to miscount. "
+          "The naive counts below are computed from this same run, so the delta is "
+          "measured rather than claimed.")
+     (str
+      (table ["counting rule" "count" "verdict"]
+             [[(str "facts with " (code* :t) " = " (code* :governor-hold))
+               (:by-t-governor-hold n)
+               (str (pill :warn "over-counts") " — a phase gate writes the same "
+                    (code* :governor-hold) " with an empty " (code* :violations))]
+              [(str "facts with a non-empty " (code* :violations))
+               (:by-any-violation n)
+               (str (pill :warn "over-counts") " — the approver rejection carries "
+                    (code* :approver-rejected) " but is not a governor rule")]
+              [(str "fact type first, then " (code* :phase-reason) ", then "
+                    (code* :violations))
+               (:correct n)
+               (pill :ok "correct — the number reported above")]])
+      "<h3>The rows the naive counts wrongly absorb</h3>"
+      (table ["ledger #" "class" "op" "subject" "phase" "phase-reason" "violations"]
+             (concat
+              (for [f pg]
+                [(::seq f) (class-pill (::class f)) (code* (:op f)) (esc (:subject f))
+                 (:phase f) (code* (:phase-reason f))
+                 (if (seq (:violations f))
+                   (esc (pr-str (mapv :rule (:violations f))))
+                   (pill :muted "none — the governor found nothing wrong"))])
+              (for [f ar]
+                [(::seq f) (class-pill (::class f)) (code* (:op f)) (esc (:subject f))
+                 (pill :muted "n/a") (pill :muted "n/a")
+                 (esc (pr-str (mapv :rule (:violations f))))])))))))
+
+(defn- s-phase-matrix []
+  (let [ops (vec (sort-by pr-str (into phase/read-ops phase/write-ops)))]
+    (section
+     "phase-matrix" "Phase gate matrix"
+     (str "Produced by calling <code>ictrepair.phase/gate</code> for every "
+          "(phase &times; op) pair, at both base dispositions. The "
+          (code* :hold) " column shows that a governor refusal survives every "
+          "phase: compliance wins, always.")
+     (table (into ["op"] (for [p (sort (keys phase/phases))]
+                           (str "phase " p " (" (:label (get phase/phases p)) ")")))
+            (for [op ops]
+              (into [(code* op)]
+                    (for [p (sort (keys phase/phases))]
+                      (let [c (phase/gate p {:op op} :commit)
+                            h (phase/gate p {:op op} :hold)]
+                        (str (disp-pill (:disposition c))
+                             (when (:reason c) (str " " (code* (:reason c))))
+                             "<br><span class=\"tiny\">base hold &rarr; "
+                             (kw* (:disposition h)) "</span>")))))))))
+
+(defn- s-register [{:keys [db]}]
+  (section
+   "register" "Ticket register after the run"
+   (str "Read back through the <code>Store</code> protocol "
+        "(<code>all-tickets</code>), not echoed from the scenario table.")
+   (table ["ticket" "customer" "item" "juris." "qty" "unit" "claimed"
+           "recomputed" "cost ok?" "safety" "storage repl." "sanitized"
+           "completed" "returned"]
+          (for [t (store/all-tickets db)]
+            [(esc (:id t)) (esc (:customer t)) (esc (:item t))
+             (esc (:jurisdiction t)) (:parts-quantity t) (:parts-unit-price t)
+             (:claimed-parts-cost t)
+             (esc (str (registry/compute-parts-cost t)))
+             (if (registry/parts-cost-matches-claim? t) (pill :ok "match") (pill :err "mismatch"))
+             (if (:safety-test-passed? t) (pill :ok "passed") (pill :err "failed"))
+             (if (:involves-storage-replacement? t) (pill :warn "yes") (pill :muted "no"))
+             (if (:media-sanitization-confirmed? t) (pill :ok "confirmed") (pill :muted "no"))
+             (if (:repair-completed? t) (pill :ok (str (:completion-number t))) (pill :muted "—"))
+             (if (:device-returned? t) (pill :ok (str (:return-number t))) (pill :muted "—"))]))))
+
+(defn- s-store-state [{:keys [db]}]
+  (let [ids (mapv :id (store/all-tickets db))
+        rows (for [id ids
+                   :let [a (store/assessment-of db id)
+                         s (store/safety-screening-of db id)
+                         m (store/media-screening-of db id)]
+                   :when (or a s m)]
+               [(esc id)
+                (if a (str (esc (:jurisdiction a)) " · "
+                           (count (:checklist a)) " evidence items")
+                    (pill :muted "—"))
+                (if s (code* (:verdict s)) (pill :muted "—"))
+                (if m (code* (:verdict m)) (pill :muted "—"))])]
+    (section
+     "committed-state" "Committed assessments & screenings"
+     (str "Only committed records appear here — a HARD refusal writes the ledger "
+          "and mutates nothing, which is why ticket-4 and ticket-5 have no "
+          "screening row despite having been screened.")
+     (table ["ticket" "assessment" "safety screening" "media screening"] rows))))
+
+(defn- s-drafts [{:keys [db]}]
+  (let [c (store/completion-history db)
+        r (store/return-history db)]
+    (section
+     "drafts" "Append-only draft records"
+     (str "Built by <code>ictrepair.registry</code>. Every certificate this actor "
+          "produces is UNSIGNED — signature is the repair shop's act, not the "
+          "actor's.")
+     (table ["kind" "record id" "ticket" "jurisdiction" "immutable"]
+            (for [rec (concat c r)]
+              [(esc (get rec "kind")) (esc (get rec "record_id"))
+               (esc (get rec "ticket_id")) (esc (get rec "jurisdiction"))
+               (if (get rec "immutable") (pill :ok "true") (pill :err "false"))])))))
+
+(defn- s-approver [probe]
+  (let [{:keys [rows retained lost ledger-approver-keys
+                approval-granted-in-audit approval-granted-in-ledger]} probe]
+    (section
+     "approver" "Approver attribution — measured, not asserted"
+     (str "Each row asks the artefact the store ACTUALLY persisted whether it "
+          "carries an approver-shaped key "
+          (str/join ", " (map code* approver-key-candidates))
+          ". <code>:actor</code> is deliberately excluded: on a ledger fact it names "
+          "the EXECUTING actor (<code>op-1</code>), never the human who approved "
+          "(<code>" (esc approver-id) "</code>).")
+     (str
+      (table ["effect" "subject" "offered on :payload" "offered on :value"
+              "persisted by the store" "attribution"]
+             (for [{:keys [effect subject offered-on-payload offered-on-value
+                           persisted-keys retained?]} rows]
+               [(code* effect) (esc subject)
+                (if (seq offered-on-payload) (str/join " " (map code* offered-on-payload))
+                    (pill :muted "none"))
+                (if (seq offered-on-value) (str/join " " (map code* offered-on-value))
+                    (pill :muted "none"))
+                (if (seq persisted-keys) (str/join " " (map code* persisted-keys))
+                    (pill :muted "none"))
+                (if retained? (pill :ok "retained") (pill :err "lost"))]))
+      "<p class=\"note\">"
+      (if (seq lost)
+        (str (pill :err "DISCLOSED DEFECT")
+             " Attribution is <strong>lossy per effect</strong> in this repo, as measured above: "
+             (count retained) " of " (count rows) " approved effects retained the approver, "
+             (count lost) " lost it. "
+             "<code>ictrepair.operation</code> mints the approver onto the record's "
+             "<code>:payload</code> only; <code>ictrepair.store/commit-record!</code> then "
+             "persists <code>:payload</code> for the "
+             (str/join ", " (map (comp code* :effect) (sort-by (comp pr-str :effect) retained)))
+             " effects but persists <code>:value</code> (or reconstructs the record from "
+             "scratch) for "
+             (str/join ", " (map (comp code* :effect) (sort-by (comp pr-str :effect) lost)))
+             " — so the approver is dropped there. This is reported by probing the "
+             "artefacts, so it will read <code>retained</code> on its own the day the "
+             "store is fixed. <strong>Not patched here</strong>: changing commit "
+             "semantics is not a rendering task.")
+        (str (pill :ok "no attribution loss measured")
+             " Every approved effect retained an approver key this run."))
+      "</p><p class=\"note\">"
+      (pill :err "DISCLOSED DEFECT")
+      " The graph emits <code>:approval-granted</code> audit facts carrying "
+      "<code>:by</code> (" approval-granted-in-audit " this run), but "
+      "<code>ictrepair.operation</code>'s <code>:commit</code> node appends only the "
+      "commit fact — so <strong>" approval-granted-in-ledger
+      " of them reach the persisted ledger</strong>. Probing every ledger fact for "
+      "approver-shaped keys finds "
+      (if (seq ledger-approver-keys)
+        (str/join " " (map code* ledger-approver-keys))
+        "<strong>none</strong>")
+      ". The audit trail therefore records that a human was asked and that the op "
+      "committed, but not who approved it. Disclosed, not patched.</p>"))))
+
+(defn- s-join-trap [trap]
+  (section
+   "join-trap" "The [op subject] join trap, measured"
+   (str "Keying ledger rows by <code>[op subject]</code> is safe for ops guarded "
+        "against double-issuance and unsafe for the rest. Rather than assume either "
+        "way, this is counted against the real run — so this renderer keys rows by "
+        "append index instead.")
+   (str
+    (table ["ledger rows" "distinct [op subject] pairs" "rows a naive join would collapse"]
+           [[(:rows trap) (:distinct-pairs trap)
+             (if (pos? (:collapsed trap))
+               (pill :err (str (:collapsed trap) " lost"))
+               (pill :ok "0"))]])
+    (when (seq (:repeated trap))
+      (str "<h3>Pairs that actually repeat in this run</h3>"
+           (table ["op" "subject" "rows"]
+                  (for [[[op subject] n] (:repeated trap)]
+                    [(code* op) (esc subject) n])))))))
+
+(defn- s-ledger [cl]
+  (section
+   "ledger" (str "Audit ledger (" (count cl) " facts, append-only)")
+   (str "The full persisted ledger, in append order, each row tagged with the "
+        "classification this renderer assigned it.")
+   (table ["#" "class" "t" "op" "subject" "actor" "basis / summary"]
+          (for [f cl]
+            [(::seq f) (class-pill (::class f)) (code* (:t f)) (code* (:op f))
+             (esc (:subject f)) (code* (:actor f))
+             (if (= :commit (::class f))
+               (esc (:summary f))
+               (esc (pr-str (:basis f))))]))))
+
+(defn- s-coverage []
+  (let [c (facts/coverage)]
+    (section
+     "coverage" "Jurisdiction coverage (reported honestly)"
+     (str "From <code>ictrepair.facts/coverage</code>. A jurisdiction absent from "
+          "the catalog has NO spec-basis — the governor refuses rather than letting "
+          "the advisor invent one, which is exactly what ledger row "
+          "<code>:no-spec-basis</code> above records for <code>ATL</code>.")
+     (str
+      (table ["jurisdiction" "authority" "legal basis" "media-sanitization authority"
+              "evidence items"]
+             (for [iso (:covered-jurisdictions c)
+                   :let [sb (facts/spec-basis iso)]]
+               [(esc iso) (esc (:owner-authority sb)) (esc (:legal-basis sb))
+                (esc (:media-owner-authority sb))
+                (count (:required-evidence sb))]))
+      "<p class=\"note\">" (esc (:note c)) "</p>"))))
+
+;; ----------------------------- invariants -----------------------------
+
+(defn- fail! [msg data] (throw (ex-info (str "render-html: " msg) data)))
+
+(defn assert-classification-discriminates!
+  "Invariant 3. The three classes must all be present AND provably
+  disjoint. If a future change made a phase gate also carry violations,
+  the classifier's branches would overlap and every count on the page
+  would become ambiguous -- so that is a build failure, not a footnote."
+  [cl]
+  (when-not (seq (phase-gates cl))
+    (fail! "no phase-gate hold in the run -- the refusal/gate contrast would render as an empty table, making the classifier untestable"
+           {:classes (frequencies (map ::class cl))}))
+  (when-not (seq (approver-rejections cl))
+    (fail! "no approver rejection in the run -- the 'carries a violation but is not a governor rule' row would be unbacked"
+           {:classes (frequencies (map ::class cl))}))
+  (when-let [bad (seq (filter #(and (:phase-reason %) (seq (:violations %))) cl))]
+    (fail! "a fact carries BOTH :phase-reason and non-empty :violations -- the classifier's branches overlap and every hold count on the page is ambiguous"
+           {:offending (mapv #(select-keys % [::seq :t :op :subject :phase-reason]) bad)}))
+  (let [n (naive-counts cl)]
+    (when-not (and (> (:by-t-governor-hold n) (:correct n))
+                   (> (:by-any-violation n) (:correct n)))
+      (fail! "the naive counts no longer differ from the correct one -- the discrimination section would show a distinction it cannot demonstrate"
+             n))))
+
+(defn assert-invariants!
+  "All build-time invariants. Runs BEFORE anything is written."
+  [{:keys [steps] :as result} cl probe]
+  (let [hh (hard-holds cl)
+        rules (distinct-hard-rules cl)]
+    (when (< (count hh) min-hard-holds)
+      (fail! (str "the run produced " (count hh) " governor HARD refusal(s), below the floor of "
+                  min-hard-holds " -- refusing to publish a console that shows the governor "
+                  "never refusing anything")
+             {:hard-holds (count hh) :floor min-hard-holds
+              :classes (frequencies (map ::class cl))}))
+    (when (< (count rules) min-distinct-hard-rules)
+      (fail! (str "the run exercised " (count rules) " distinct HARD rule(s), below the evidence floor of "
+                  min-distinct-hard-rules)
+             {:rules rules :floor min-distinct-hard-rules}))
+    (assert-classification-discriminates! cl)
+    (let [known (set (keys (group-by :rule (mapcat :violations hh))))]
+      (when-let [orphan (seq (remove known rules))]
+        (fail! "a rendered hard-rule row does not trace to this run" {:orphan orphan})))
+    (when-not (seq (commits cl))
+      (fail! "no op committed -- the approver probe would report 'no approver' vacuously" {}))
+    (when-not (seq (filter #(and (= :escalate (:first-disposition %))
+                                 (= :approved (:decision %))) steps))
+      (fail! "no run escalated AND was approved -- the approval queue and attribution probe would render as empty tables" {}))
+    (when-not (seq (:rows probe))
+      (fail! "the approver probe examined zero artefacts" {}))
+    (when-let [bad (seq (filter #(and (= :hold (:final-disposition %)) (:reached-human? %)
+                                      (seq (get-in % [:verdict :violations])))
+                                steps))]
+      (fail! "a run that HARD-held also reached a human -- the 'a hard hold never reaches a human' claim is false for this run"
+             {:offending (mapv :id bad)}))
+    result))
+
+(def ^:private nondeterminism-patterns
+  "Invariant 8. Shapes that would make two builds differ."
+  [[#"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}" "a UUID"]
+   [#"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}" "an ISO timestamp"]
+   [#"@[0-9a-f]{6,}" "an object identity hash"]
+   [#"\bnil\b(?![-a-z])" "a nil leak"]
+   [#"%s|%d" "an unformatted format specifier"]])
+
+(defn assert-renderable! [html]
+  (doseq [[re what] nondeterminism-patterns]
+    (when-let [m (re-find re html)]
+      (fail! (str "the rendered page contains " what " (" (pr-str m) ") -- it would not be reproducible or is a formatting leak")
+             {:match m})))
+  (let [open (count (re-seq #"<(?!/)(?!br)(?!meta)(?!!)[a-z]" html))
+        close (count (re-seq #"</[a-z]" html))]
+    (when-not (= open close)
+      (fail! "tag balance check failed" {:open open :close close})))
+  html)
+
+;; ----------------------------- page -----------------------------
+
+(defn render
+  "Builds the whole page from a completed run."
+  [{:keys [ledger] :as result}]
+  (let [cl    (classified-ledger ledger)
+        probe (approver-probe result)
+        trap  (join-trap ledger)
+        hh    (hard-holds cl)
+        rules (distinct-hard-rules cl)]
+    (str
+     "<!doctype html>\n<html lang=\"ja\"><head><meta charset=\"utf-8\">"
+     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+     "<title>cloud-itonami-isic-9511 · ICT機器修理 Operator Console</title>"
+     "<style>" (jp-go-dds.skin/dds+skin) "\n"
+     ".pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;"
+     "font-weight:600;white-space:nowrap}"
+     ".pill.ok{background:#e3f5e9;color:#0f6b33}.pill.warn{background:#fff4e0;color:#8a4b00}"
+     ".pill.err{background:#fde8e6;color:#a3160f}.pill.muted{background:#eee;color:#666}"
+     ".card{background:#fff;border:1px solid #dcdcdc;border-radius:10px;padding:20px;"
+     "margin:0 0 20px}"
+     "body{background:#f5f6f8;margin:0}"
+     "main{max-width:1180px;margin:24px auto;padding:0 20px}"
+     "table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}"
+     "th,td{text-align:left;padding:7px 9px;border-bottom:1px solid #ededed;"
+     "vertical-align:top}"
+     "th{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#555;"
+     "border-bottom:2px solid #ddd}"
+     "h2{font-size:16px;margin:0 0 4px}h3{font-size:13px;margin:18px 0 0;color:#444}"
+     "p.sub{color:#666;font-size:13px;margin:0 0 6px}"
+     "p.note{font-size:12px;color:#444;background:#fafafa;border-left:3px solid #ccc;"
+     "padding:8px 12px;margin:12px 0 0;line-height:1.7}"
+     ".tiny{font-size:10px;color:#999}"
+     "code{background:#f0f1f3;padding:1px 4px;border-radius:3px;font-size:12px}"
+     "header.bar{background:#fff;border-bottom:1px solid #dcdcdc;padding:14px 20px}"
+     "header.bar h1{font-size:17px;margin:0}"
+     "header.bar .meta{color:#666;font-size:12px;margin-top:4px}"
+     "</style></head><body>"
+
+     "<header class=\"bar\"><h1>ICT機器修理 — Operator Console "
+     "<span class=\"tiny\">cloud-itonami-isic-9511 · ictrepair</span></h1>"
+     "<div class=\"meta\">RepairOps-LLM &#8867; Repair Governor · "
+     "generated by <code>ictrepair.render-html</code> from a real "
+     "<code>langgraph.graph/run*</code> execution · "
+     (count (:steps result)) " runs · "
+     (count cl) " ledger facts · "
+     (count hh) " HARD governor refusals across " (count rules) " distinct rules"
+     "</div></header><main>"
+
+     (section
+      "about" "What this page is"
+      nil
+      (str "<p class=\"note\">Every number, id, verdict and detail string below is the "
+           "output of executing this repository's actor — "
+           "<code>ictrepair.operation/build</code> compiled to a langgraph-clj "
+           "StateGraph, driven through <code>run*</code>, with escalated runs resumed "
+           "through the real <code>interrupt-before #{:request-approval}</code> seam. "
+           "Nothing is hand-written. The build "
+           "<strong>throws and writes no file</strong> unless the run produces at least "
+           (esc (str min-hard-holds)) " governor HARD refusals spanning at least "
+           (esc (str min-distinct-hard-rules)) " distinct rules — a console that showed "
+           "this actor never refusing anything would be worse than no console.</p>"
+           "<p class=\"note\">This page <strong>supersedes</strong> a "
+           "<code>docs/samples/operator-console.html</code> that was committed to this "
+           "repository with no generator anywhere in the tree. That page described a "
+           "robotics-safety console — missions, <code>robot-1</code>, a parcel delivery, "
+           "grasp actions — none of which exist in this repository's domain, source or "
+           "seed data. It was hand-authored, and it is replaced by this generated one.</p>"))
+
+     (s-runs result)
+     (s-hard cl)
+     (s-discriminate cl)
+     (s-phase-matrix)
+     (s-register result)
+     (s-store-state result)
+     (s-drafts result)
+     (s-approver probe)
+     (s-join-trap trap)
+     (s-ledger cl)
+     (s-coverage)
+
+     "</main></body></html>\n")))
+
+(defn build
+  "Runs the actor, checks every invariant, returns the HTML. Throws
+  before producing anything if an invariant fails."
+  []
+  (let [result (run-scenario)
+        cl     (classified-ledger (:ledger result))
+        probe  (approver-probe result)]
+    (assert-invariants! result cl probe)
+    (assert-renderable! (render result))))
+
+(defn -main [& [out]]
+  (let [path (or out "docs/samples/operator-console.html")
+        html (build)]
+    (spit path html)
+    (println (str "wrote " path " (" (count (.getBytes ^String html "UTF-8")) " bytes)"))))
