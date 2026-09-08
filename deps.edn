@@ -10,7 +10,12 @@
  ;; system; `jp-go-dds.skin` supplies the stylesheet the build-time
  ;; operator console (`ictrepair.render-html`) inlines. Pinned by git
  ;; sha so a standalone fork resolves it without the monorepo checkout.
- :deps {io.github.kotoba-lang/langgraph
+ :deps {
+        ;; kotoba.lang.text, not clojure.string. Pinned as an explicit floor:
+        ;; tools.deps takes the NEWEST sha it is shown, so without a floor here
+        ;; this repo silently rides whatever a sibling happens to name.
+        io.github.kotoba-lang/text {:git/sha "73bdb13ae7a3d004b44bca08be03a3191157a38f"}
+       io.github.kotoba-lang/langgraph
         {:local/root "../../kotoba-lang/langgraph"}
         io.github.kotoba-lang/jp-go-digital-design-system
         {:git/url "https://github.com/kotoba-lang/jp-go-digital-design-system"
