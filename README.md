@@ -77,7 +77,7 @@ independent layers enforce this (`ictrepair.governor`'s `:actuation/
 complete-repair`/`:actuation/return-device` high-stakes gate and
 `ictrepair.phase`'s phase table, which never puts either op in any
 phase's `:auto` set) -- see `ictrepair.phase`'s docstring and
-`test/ictrepair/phase_test.clj`'s `repair-complete-never-auto-at-any-
+`test/ictrepair/phase_test.kotoba`'s `repair-complete-never-auto-at-any-
 phase`/`device-return-never-auto-at-any-phase`. The actor may draft,
 check and recommend; a human repair technician is always the one who
 actually completes a repair or returns a device. Grounded directly in
@@ -172,14 +172,14 @@ stack only -- no bespoke domain capability lib to reference at all.
 
 | File | Role |
 |---|---|
-| `src/ictrepair/store.cljc` | **Store** protocol -- `MemStore` ‖ `DatomicStore` (`langchain.db`) + append-only audit ledger + repair-completion AND device-return history (dual history, mirroring `repairshop`/9521's, `commrepair`/9512's, `applianceshop`/9522's, `furniture`/9524's, `specialtyrepair`/9529's and `leathergoods`/9523's own shape). The double-actuation guard checks dedicated `:repair-completed?`/`:device-returned?` booleans rather than a `:status` value |
-| `src/ictrepair/registry.cljc` | Repair-completion/device-return draft records, plus `parts-cost-matches-claim?` -- an HONEST, literal reuse of `repairshop.registry`'s/`commrepair.registry`'s/`applianceshop.registry`'s/`furniture.registry`'s/`specialtyrepair.registry`'s/`leathergoods.registry`'s own EXACT-MATCH independent-recompute check for the SAME real-world concern, not claimed as new |
-| `src/ictrepair/facts.cljc` | Per-jurisdiction consumer-product-safety AND media-sanitization/data-destruction catalog (a genuine extension beyond every prior sibling's own catalog) with an official spec-basis citation per entry, honest coverage reporting -- ALL FOUR seeded jurisdictions have a media-sanitization sub-citation here |
-| `src/ictrepair/repairopsllm.cljc` | **RepairOps-LLM** -- `mock-advisor` ‖ `llm-advisor`; intake/jurisdiction-assessment/safety-screening/media-screening/repair-completion/device-return proposals |
-| `src/ictrepair/governor.cljc` | **Repair Governor** -- 7 HARD checks (spec-basis · evidence-incomplete · parts-cost-mismatch, honest reuse · safety-test-not-passed, honest reuse · media-sanitization-unconfirmed, CONDITIONAL unconditional evaluation, GENUINELY NEW, the 70th grounding of this discipline · already-completed guard · already-returned guard) + 1 soft (confidence/actuation gate) |
-| `src/ictrepair/phase.cljc` | **Phase 0→3** -- read-only → assisted intake → assisted assess → supervised (repair completion/device return always human; ticket intake is the ONLY auto-eligible op, no direct capital risk) |
-| `src/ictrepair/operation.cljc` | **OperationActor** -- langgraph StateGraph |
-| `src/ictrepair/sim.cljc` | demo driver |
+| `src/ictrepair/store.kotoba` | **Store** protocol -- `MemStore` ‖ `DatomicStore` (`langchain.db`) + append-only audit ledger + repair-completion AND device-return history (dual history, mirroring `repairshop`/9521's, `commrepair`/9512's, `applianceshop`/9522's, `furniture`/9524's, `specialtyrepair`/9529's and `leathergoods`/9523's own shape). The double-actuation guard checks dedicated `:repair-completed?`/`:device-returned?` booleans rather than a `:status` value |
+| `src/ictrepair/registry.kotoba` | Repair-completion/device-return draft records, plus `parts-cost-matches-claim?` -- an HONEST, literal reuse of `repairshop.registry`'s/`commrepair.registry`'s/`applianceshop.registry`'s/`furniture.registry`'s/`specialtyrepair.registry`'s/`leathergoods.registry`'s own EXACT-MATCH independent-recompute check for the SAME real-world concern, not claimed as new |
+| `src/ictrepair/facts.kotoba` | Per-jurisdiction consumer-product-safety AND media-sanitization/data-destruction catalog (a genuine extension beyond every prior sibling's own catalog) with an official spec-basis citation per entry, honest coverage reporting -- ALL FOUR seeded jurisdictions have a media-sanitization sub-citation here |
+| `src/ictrepair/repairopsllm.kotoba` | **RepairOps-LLM** -- `mock-advisor` ‖ `llm-advisor`; intake/jurisdiction-assessment/safety-screening/media-screening/repair-completion/device-return proposals |
+| `src/ictrepair/governor.kotoba` | **Repair Governor** -- 7 HARD checks (spec-basis · evidence-incomplete · parts-cost-mismatch, honest reuse · safety-test-not-passed, honest reuse · media-sanitization-unconfirmed, CONDITIONAL unconditional evaluation, GENUINELY NEW, the 70th grounding of this discipline · already-completed guard · already-returned guard) + 1 soft (confidence/actuation gate) |
+| `src/ictrepair/phase.kotoba` | **Phase 0→3** -- read-only → assisted intake → assisted assess → supervised (repair completion/device return always human; ticket intake is the ONLY auto-eligible op, no direct capital risk) |
+| `src/ictrepair/operation.kotoba` | **OperationActor** -- langgraph StateGraph |
+| `src/ictrepair/sim.kotoba` | demo driver |
 | `test/ictrepair/*_test.clj` | governor contract · phase invariants · store parity · registry conformance · facts coverage |
 
 ## Business-process coverage (honest)
