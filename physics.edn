@@ -1,0 +1,33 @@
+;; What this vertical's robot physically does, declared for
+;; kotoba.robotics.process (kotoba-lang/robotics). `kbb -M:dev:physics` runs it.
+;;
+;; README "Robotics premise": a repair robot performs disassembly, component
+;; handling, soldering and testing on computers and peripherals (ISIC 9511),
+;; gated by the Repair Governor. Its physical work here is preheating a
+;; circuit board from below before rework soldering, and lifting the customer
+;; device (desktop tower / monitor) from the intake shelf onto the bench.
+;;
+;; Every number without a cited source is marked `estimate` in its :basis.
+;; Replacing an estimate with a sourced value is this bot's growth work.
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isic-9511"
+ :cases
+ [{:id :pcb-bottom-preheat
+   :kind :thermal
+   :procedure "rework station heats a 1.6 mm FR-4 motherboard from below with hot air until its top (component) side reaches the preheat temperature before the part is desoldered"
+   :params {:thickness-m 0.0016 :conductivity-w-mk 0.3 :density-kg-m3 1850.0 :specific-heat-j-kgk 1100.0
+            :t0-c 25.0 :h-front-w-m2k 60.0 :t-back-ambient-c 25.0 :h-back-w-m2k 10.0
+            :threshold-c 100.0 :duration-s 900.0 :nodes 11}
+   :sweep {:param :t-hot-c :values [150.0 175.0 200.0 250.0 300.0]}
+   :quantity :time-to-threshold-s
+   :limit {:max 120.0 :basis "estimate: preheat to 100 C top-side within two minutes so rework does not dwell the board at temperature; FR-4 through-thickness properties and hot-air heat transfer coefficient are estimates"}
+   :boundary {:lo 110.0 :hi 400.0}}
+  {:id :device-onto-bench
+   :kind :manipulator
+   :procedure "arm lifts the customer's desktop tower from the intake shelf onto the repair bench"
+   :params {:l1-m 0.50 :l2-m 0.45 :m1-kg 5.0 :m2-kg 3.5
+            :from [0.60 0.00] :to [0.35 0.45] :duration-s 2.5 :steps 500}
+   :sweep {:param :payload-kg :values [2.0 4.0 6.0 8.0 10.0 12.0]}
+   :quantity :peak-tau1-nm
+   :limit {:max 100.0 :basis "estimate: continuous shoulder torque of a 10 kg-class collaborative arm"}
+   :boundary {:lo 0.5 :hi 40.0}}]}
